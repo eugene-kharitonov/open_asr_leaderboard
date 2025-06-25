@@ -4,6 +4,7 @@ export PYTHONPATH="..":$PYTHONPATH
 
 echo "using kyutai/stt-1b-en_fr for debugging; should use 2.6B model for the actual eval!"
 
+#MODEL_IDs=("kyutai/stt-2.6b-en")
 MODEL_IDs=("kyutai/stt-1b-en_fr")
 BATCH_SIZE=8
 

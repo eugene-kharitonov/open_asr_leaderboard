@@ -9,29 +9,43 @@ import julius
 from moshi import models
 
 wer_metric = evaluate.load("wer")
-torch.set_float32_matmul_precision('high')
+torch.set_float32_matmul_precision("high")
 
 
 def load_model(model_path):
 
     info = models.loaders.CheckpointInfo.from_hf_repo(model_path)
 
-    mimi = info.get_mimi(device='cuda')
+    mimi = info.get_mimi(device="cuda")
     tokenizer = info.get_text_tokenizer()
-    lm = info.get_moshi(device="cuda", dtype=torch.bfloat16,)
+    lm = info.get_moshi(
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
     lm_gen = models.LMGen(lm, temp=0, temp_text=0.0)
 
+    padding_token_id = info.raw_config.get("text_padding_token_id", 3)
+    # Putting in some conservative defaults
+    audio_silence_prefix_seconds = info.stt_config.get(
+        "audio_silence_prefix_seconds", 1.0
+    )
+    audio_delay_seconds = info.stt_config.get("audio_delay_seconds", 5.0)
 
-    return mimi, tokenizer, lm, lm_gen
+    return (
+        mimi,
+        tokenizer,
+        lm,
+        lm_gen,
+        padding_token_id,
+        audio_silence_prefix_seconds,
+        audio_delay_seconds,
+    )
 
 
 @torch.inference_mode
 def get_padded_batch(
-    audios,
-    sample_rates,
-    before_padding: float,
-    after_padding: float,
-    ):
+    audios, sample_rates, before_padding: float, after_padding: float, frame_size: int
+):
     sample_rate = 24_000
 
     batch = []
@@ -45,34 +59,52 @@ def get_padded_batch(
         max_len = max(max_len, audio.shape[-1])
         batch.append(audio)
 
-
-    mimi_frame_size = 1920
     target = max_len
-    if target % mimi_frame_size != 0:
-        target = target + (mimi_frame_size - max_len % mimi_frame_size)
+    if target % frame_size != 0:
+        target = target + (frame_size - max_len % frame_size)
 
-    batch = torch.stack([torch.nn.functional.pad(audio, (0, target - audio.shape[-1])) for audio in batch])
+    batch = torch.stack(
+        [
+            torch.nn.functional.pad(audio, (0, target - audio.shape[-1]))
+            for audio in batch
+        ]
+    )
     return batch
- 
+
 
 def main(args):
-    mimi, _tokenizer, _lm, lm_gen = load_model(args.model_id)
+    (
+        mimi,
+        tokenizer,
+        _lm,
+        lm_gen,
+        padding_token_id,
+        audio_silence_prefix_seconds,
+        audio_delay_seconds,
+    ) = load_model(args.model_id)
+
+    mimi_frame_size = mimi.frame_size
 
     def benchmark(batch):
         # Load audio inputs
         audios = [torch.from_numpy(audio["array"]) for audio in batch["audio"]]
         sample_rates = [ex["sampling_rate"] for ex in batch["audio"]]
 
-        batch["audio_length_s"] = [len(audio) / batch["audio"][0]["sampling_rate"] for audio in audios]
+        batch["audio_length_s"] = [
+            len(audio) / batch["audio"][0]["sampling_rate"] for audio in audios
+        ]
         minibatch_size = len(audios)
 
         # Start timing
         start_time = time.time()
 
-        # NB: it is vital to add after_padding equal or slightly above the model delay "audio_delay_seconds" 
-        # see ("stt_config" in config.json).
-        # Equally, before padding should be set to "audio_silence_prefix_seconds" from the config
-        padded_batch = get_padded_batch(audios, sample_rates, before_padding=1.0, after_padding=5.0)
+        padded_batch = get_padded_batch(
+            audios,
+            sample_rates,
+            before_padding=audio_silence_prefix_seconds,
+            after_padding=audio_delay_seconds,
+            frame_size=mimi_frame_size,
+        )
         padded_batch = padded_batch.to(args.device).float()
 
         bsz = padded_batch.shape[0]
@@ -81,7 +113,7 @@ def main(args):
 
         with mimi.streaming(bsz), lm_gen.streaming(bsz):
             for offset in range(0, padded_batch.shape[-1], mimi.frame_size):
-                audio_chunk = padded_batch[:, offset:offset + mimi.frame_size].cuda()
+                audio_chunk = padded_batch[:, offset : offset + mimi.frame_size].cuda()
                 tokens = mimi.encode(audio_chunk[:, None, :])
                 text_tokens = lm_gen.step(tokens)
                 text_tokens_acc.append(text_tokens)
@@ -89,7 +121,10 @@ def main(args):
         pred_tokens = torch.concat(text_tokens_acc, axis=-1).squeeze(dim=1)
         pred_tokens = torch.unbind(pred_tokens, dim=0)
 
-        pred_text = [ _tokenizer.decode(t[t > 3].cpu().numpy().tolist()) for t in pred_tokens ]
+        pred_text = [
+            tokenizer.decode(t[t > padding_token_id].cpu().numpy().tolist())
+            for t in pred_tokens
+        ]
 
         # End timing
         runtime = time.time() - start_time
@@ -110,8 +145,12 @@ def main(args):
         if args.streaming:
             warmup_dataset = warmup_dataset.take(num_warmup_samples)
         else:
-            warmup_dataset = warmup_dataset.select(range(min(num_warmup_samples, len(warmup_dataset))))
-        warmup_dataset = iter(warmup_dataset.map(benchmark, batch_size=args.batch_size, batched=True))
+            warmup_dataset = warmup_dataset.select(
+                range(min(num_warmup_samples, len(warmup_dataset)))
+            )
+        warmup_dataset = iter(
+            warmup_dataset.map(benchmark, batch_size=args.batch_size, batched=True)
+        )
 
         for _ in tqdm(warmup_dataset, desc="Warming up..."):
             continue
@@ -127,7 +166,10 @@ def main(args):
             dataset = dataset.select(range(min(args.max_eval_samples, len(dataset))))
 
     dataset = dataset.map(
-        benchmark, batch_size=args.batch_size, batched=True, remove_columns=["audio"],
+        benchmark,
+        batch_size=args.batch_size,
+        batched=True,
+        remove_columns=["audio"],
     )
 
     all_results = {
@@ -158,7 +200,9 @@ def main(args):
         references=all_results["references"], predictions=all_results["predictions"]
     )
     wer = round(100 * wer, 2)
-    rtfx = round(sum(all_results["audio_length_s"]) / sum(all_results["transcription_time_s"]), 2)
+    rtfx = round(
+        sum(all_results["audio_length_s"]) / sum(all_results["transcription_time_s"]), 2
+    )
     print("WER:", wer, "%", "RTFx:", rtfx)
 
 
