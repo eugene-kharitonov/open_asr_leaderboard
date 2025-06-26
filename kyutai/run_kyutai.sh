@@ -3,7 +3,7 @@
 export PYTHONPATH="..":$PYTHONPATH
 
 MODEL_IDs=("kyutai/stt-2.6b-en")
-BATCH_SIZE=48
+BATCH_SIZE=384
 
 num_models=${#MODEL_IDs[@]}
 for (( i=0; i<${num_models}; i++ ));
