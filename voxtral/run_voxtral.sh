@@ -2,7 +2,7 @@
 
 export PYTHONPATH="..":$PYTHONPATH
 
-MODEL_IDs=("mistralai/Voxtral-Mini-3B-2507")
+MODEL_IDs=("mistralai/Voxtral-Mini-3B-2507" "mistralai/Voxtral-Mini-3B-2507")
 
 BATCH_SIZE=48
 

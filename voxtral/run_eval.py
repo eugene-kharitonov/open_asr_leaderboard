@@ -1,7 +1,6 @@
 import argparse
 import os
 import soundfile
-import librosa
 import tempfile
 import torch
 from transformers import AutoProcessor, VoxtralForConditionalGeneration
@@ -19,7 +18,7 @@ def main(args):
     processor = AutoProcessor.from_pretrained(args.model_id)
     model = VoxtralForConditionalGeneration.from_pretrained(args.model_id, torch_dtype=torch.bfloat16, device_map=args.device)
 
-    def benchmark(batch):
+    def benchmark(batch, min_new_tokens=500):
         # Load audio inputs
         audios = [audio["array"] for audio in batch["audio"]]
         minibatch_size = len(audios)
@@ -38,14 +37,13 @@ def main(args):
         inputs = inputs.to(args.device, dtype=torch.bfloat16)
 
         start_time = time.time()
-        outputs = model.generate(**inputs, max_new_tokens=500)
+        outputs = model.generate(**inputs, max_new_tokens=500, do_sample=False)
 
         output_text = processor.batch_decode(outputs[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)
         # END TIMING
         runtime = time.time() - start_time
 
         for p in paths:
-            print(f'Deleting {p}')
             os.unlink(p)
 
 
